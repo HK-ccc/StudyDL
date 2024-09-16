@@ -1,0 +1,82 @@
+import json
+import jieba
+import torch
+import torch.nn as nn
+import numpy as np
+from tqdm import tqdm
+import pickle
+
+# Softmax 函数可以使用 PyTorch 的内置版本
+softmax = nn.Softmax(dim=1)
+
+def CutWords(file_tang="唐诗三百首.json", file_song="宋词三百首"):
+    stop_words = ["，", "。", "？", "\n"]
+    result = []
+    with open(file_tang, "r", encoding="utf-8") as tang_file:
+        tang = json.load(tang_file)
+        tang_poem = [poem["content"] for poem in tang]
+    for poem in tang_poem:
+        cut_words = jieba.lcut(poem)
+        result.append([word for word in cut_words if word not in stop_words])
+    return result
+
+def GetDict(data):
+    index_2_word = []
+    for words in data:
+        for word in words:
+            if word not in index_2_word:
+                index_2_word.append(word)
+    word_2_index = {word: index for index, word in enumerate(index_2_word)}
+    words_size = len(word_2_index)
+    word_2_onehot = {}
+    for word, index in word_2_index.items():
+        one_hot = np.zeros((1, words_size))
+        one_hot[0, index] = 1
+        word_2_onehot[word] = torch.tensor(one_hot, dtype=torch.float32)  # 转为 tensor
+    return word_2_index, index_2_word, word_2_onehot
+
+# 检查 GPU 是否可用
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+if __name__ == "__main__":
+    data = CutWords()
+    word_2_index, index_2_word, word_2_onehot = GetDict(data)
+
+    words_size = len(word_2_index)
+    embedding_num = 108
+    lr = 0.01
+    epoch = 10  # 训练10轮
+    n_gram = 3  # 预测前后3个词
+
+    # 初始化两个权重矩阵，用均值为 0，标准差为 1 的正态分布
+    w1 = torch.normal(0, 1, size=(words_size, embedding_num), device=device, requires_grad=True)
+    w2 = torch.normal(0, 1, size=(embedding_num, words_size), device=device, requires_grad=True)
+
+    optimizer = torch.optim.SGD([w1, w2], lr=lr)  # 使用随机梯度下降优化器
+
+    for e in range(epoch):
+        for words in tqdm(data):
+            for index, word in enumerate(words):
+                # 获取当前词语的 one-hot 向量并转移到 GPU
+                now_word_onehot = word_2_onehot[word].to(device)
+                # 获取当前词语的前后3个词语，即滑动窗口大小为7
+                other_words = words[max(index - n_gram, 0):index] + words[index + 1: index + 1 + n_gram]
+                
+                for other_word in other_words:
+                    other_word_onehot = word_2_onehot[other_word].to(device)
+                    # Embedding 生成嵌入向量
+                    hidden = now_word_onehot @ w1
+                    t = hidden @ w2
+                    pre = softmax(t)
+
+                    # 计算损失
+                    loss = -torch.sum(other_word_onehot * torch.log(pre))
+                    optimizer.zero_grad()
+                    
+                    # 反向传播和更新权重
+                    loss.backward()
+                    optimizer.step()
+
+    # 保存模型
+    with open("word2vec.pkl", "wb") as f:
+        pickle.dump([w1.cpu().detach().numpy(), word_2_index, index_2_word], f)
